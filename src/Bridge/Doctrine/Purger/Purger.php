@@ -17,6 +17,7 @@ use Doctrine\Common\DataFixtures\Purger\MongoDBPurger as DoctrineMongoDBPurger;
 use Doctrine\Common\DataFixtures\Purger\ORMPurger as DoctrineOrmPurger;
 use Doctrine\Common\DataFixtures\Purger\PHPCRPurger as DoctrinePhpCrPurger;
 use Doctrine\Common\DataFixtures\Purger\PurgerInterface as DoctrinePurgerInterface;
+use Doctrine\Common\Persistence\ManagerRegistry;
 use Doctrine\Common\Persistence\ObjectManager;
 use Doctrine\DBAL\Driver\AbstractMySQLDriver;
 use Doctrine\ODM\MongoDB\DocumentManager as DoctrineMongoDocumentManager;
@@ -38,16 +39,30 @@ use Nelmio\Alice\IsAServiceTrait;
 {
     use IsAServiceTrait;
 
-    private $manager;
-    private $purgeMode;
-    private $purger;
+    /**
+     * @var ManagerRegistry
+     */
+    private $managerRegistry;
 
-    public function __construct(ObjectManager $manager, PurgeMode $purgeMode = null)
+    /**
+     * @var PurgeMode
+     */
+    private $purgeMode;
+
+    /**
+     * @var array<DoctrinePurgerInterface>
+     */
+    private $purgerList;
+
+    public function __construct(ManagerRegistry $managerRegistry, PurgeMode $purgeMode = null)
     {
-        $this->manager = $manager;
+        $this->managerRegistry = $managerRegistry;
         $this->purgeMode = $purgeMode;
 
-        $this->purger = static::createPurger($manager, $purgeMode);
+        $this->purgerList = [];
+        foreach ($this->managerRegistry->getManagers() as $manager) {
+            $this->purgerList[] = static::createPurger($manager, $purgeMode);
+        }
     }
 
     /**
@@ -56,34 +71,22 @@ use Nelmio\Alice\IsAServiceTrait;
     public function create(PurgeMode $mode, PurgerInterface $purger = null): PurgerInterface
     {
         if (null === $purger) {
-            return new self($this->manager, $mode);
+            return new self($this->managerRegistry, $mode);
         }
 
-        if ($purger instanceof DoctrinePurgerInterface) {
-            $manager = $purger->getObjectManager();
-        } elseif ($purger instanceof self) {
-            $manager = $purger->manager;
+        if ($purger instanceof self) {
+            $managerRegistry = $purger->managerRegistry;
         } else {
             throw new InvalidArgumentException(
                 sprintf(
-                    'Expected purger to be either and instance of "%s" or "%s". Got "%s".',
-                    DoctrinePurgerInterface::class,
+                    'Expected purger to be either and instance of "%s". Got "%s".',
                     __CLASS__,
                     get_class($purger)
                 )
             );
         }
 
-        if (null === $manager) {
-            throw new InvalidArgumentException(
-                sprintf(
-                    'Expected purger "%s" to have an object manager, got "null" instead.',
-                    get_class($purger)
-                )
-            );
-        }
-
-        return new self($manager, $mode);
+        return new self($managerRegistry, $mode);
     }
 
     /**
@@ -91,26 +94,28 @@ use Nelmio\Alice\IsAServiceTrait;
      */
     public function purge()
     {
-        // Because MySQL rocks, you got to disable foreign key checks when doing a TRUNCATE unlike in for example
-        // PostgreSQL. This ideally should be done in the Purger of doctrine/data-fixtures but meanwhile we are doing
-        // it here.
-        // See the progress in https://github.com/doctrine/data-fixtures/pull/272
-        $truncateOrm = (
-            $this->purger instanceof DoctrineOrmPurger
-            && PurgeMode::createTruncateMode()->getValue() === $this->purgeMode->getValue()
-            && $this->purger->getObjectManager()->getConnection()->getDriver() instanceof AbstractMySQLDriver
-        );
+        foreach ($this->purgerList as $purger) {
+            // Because MySQL rocks, you got to disable foreign key checks when doing a TRUNCATE unlike in for example
+            // PostgreSQL. This ideally should be done in the Purger of doctrine/data-fixtures but meanwhile we are doing
+            // it here.
+            // See the progress in https://github.com/doctrine/data-fixtures/pull/272
+            $truncateOrm = (
+                $purger instanceof DoctrineOrmPurger
+                && PurgeMode::createTruncateMode()->getValue() === $this->purgeMode->getValue()
+                && $purger->getObjectManager()->getConnection()->getDriver() instanceof AbstractMySQLDriver
+            );
 
-        if ($truncateOrm) {
-            $connection = $this->purger->getObjectManager()->getConnection();
+            if ($truncateOrm) {
+                $connection = $purger->getObjectManager()->getConnection();
 
-            $connection->exec('SET FOREIGN_KEY_CHECKS = 0;');
-        }
+                $connection->exec('SET FOREIGN_KEY_CHECKS = 0;');
+            }
 
-        $this->purger->purge();
+            $purger->purge();
 
-        if ($truncateOrm && isset($connection)) {
-            $connection->exec('SET FOREIGN_KEY_CHECKS = 1;');
+            if ($truncateOrm && isset($connection)) {
+                $connection->exec('SET FOREIGN_KEY_CHECKS = 1;');
+            }
         }
     }
 
